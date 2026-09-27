@@ -1,3 +1,4 @@
+
 services:
   pandas-benchmark:
     build:
@@ -59,7 +60,8 @@ services:
       - "127.0.0.1:8888:8888"
     volumes:
       - ./notebooks:/workspace/notebooks
-      - ./results:/workspace/results:ro
+      - ./results:/workspace/results
+      - ./src:/workspace/src:ro
     working_dir: /workspace
     command:
       - jupyter

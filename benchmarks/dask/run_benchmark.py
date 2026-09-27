@@ -1,229 +1,246 @@
 ﻿
 import os
-import time
-import math
-import gc
+import sys
+from pathlib import Path
 
 import dask.dataframe as dd
-import psutil
-import pandas as pd
+import numpy as np
+
+# ============================================================
+# SETUP PATH DAN IMPORT UTILITAS
+# ============================================================
+
+PROJECT_ROOT = Path("/workspace")
+
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from benchmark_utils import (
+    DATASET_FILES,
+    REPEAT_COUNT,
+    create_result_record,
+    measure_peak_rss,
+    write_results_csv,
+)
+
+TOOL_NAME = os.getenv("TOOL_NAME", "dask")
+
+RESULTS_PATH = Path(
+    os.getenv(
+        "RESULTS_PATH",
+        "/workspace/results/raw/dask/benchmark_results.csv",
+    )
+)
+
+SCHEDULER = "threads"
 
 
-DATA_DIR = os.getenv("DATA_DIR", "/workspace/data/processed")
-OUTPUT_DIR = "/workspace/results"
+# ============================================================
+# FUNGSI OPERASI BENCHMARK
+# ============================================================
 
-VALUE_COL = "trip_distance"
-GROUP_COL = "PULocationID"
-
-REPEATS = 5
-
-DATASETS = [
-    ("100k", "taxi_100k.parquet", 100_000),
-    ("1m", "taxi_1m.parquet", 1_000_000),
-    ("full", "taxi_full.parquet", 3_530_109),
-]
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-process = psutil.Process(os.getpid())
+def read_dataset(file_path):
+    """Membaca seluruh dataset Parquet."""
+    df = dd.read_parquet(file_path)
+    return df.compute(scheduler=SCHEDULER)
 
 
-def measure(func):
-    """Mengukur waktu, perubahan RSS, dan penggunaan CPU proses."""
-    gc.collect()
+def filter_dataset(file_path):
+    """Memfilter baris dengan trip_distance > 0."""
+    df = dd.read_parquet(file_path)
 
-    rss_before = process.memory_info().rss
-    cpu_before = time.process_time()
-    wall_start = time.perf_counter()
-
-    result = func()
-
-    wall_end = time.perf_counter()
-    cpu_after = time.process_time()
-    rss_after = process.memory_info().rss
-
-    wall_seconds = wall_end - wall_start
-    cpu_seconds = cpu_after - cpu_before
-
-    memory_mb = (rss_after - rss_before) / (1024 * 1024)
-    cpu_percent = (
-        (cpu_seconds / wall_seconds) * 100
-        if wall_seconds > 0
-        else 0.0
+    return df[df["trip_distance"] > 0].compute(
+        scheduler=SCHEDULER
     )
 
-    return result, wall_seconds, memory_mb, cpu_percent
 
+def aggregate_dataset(file_path):
+    """Menghitung total trip_distance."""
+    df = dd.read_parquet(file_path)
 
-def validate_close(actual, expected):
-    return math.isclose(
-        float(actual),
-        float(expected),
-        rel_tol=1e-6,
-        abs_tol=1e-6,
+    result = df["trip_distance"].sum().compute(
+        scheduler=SCHEDULER
     )
 
+    return float(result)
+
+
+def groupby_dataset(file_path):
+    """Mengelompokkan trip_distance berdasarkan PULocationID."""
+    df = dd.read_parquet(file_path)
+
+    result = (
+        df.groupby("PULocationID")["trip_distance"]
+        .sum()
+        .compute(scheduler=SCHEDULER)
+        .reset_index()
+    )
+
+    result.columns = ["PULocationID", "trip_distance_sum"]
+
+    return result
+
+
+# ============================================================
+# VALIDASI HASIL
+# ============================================================
+
+def validate_operation(operation, result, dataset_size):
+    """Memvalidasi hasil berdasarkan jenis operasi."""
+
+    if operation == "read":
+        valid = len(result) == dataset_size
+        return "success" if valid else "failed"
+
+    elif operation == "filter":
+        valid = (
+            len(result) <= dataset_size
+            and (result["trip_distance"] > 0).all()
+        )
+        return "success" if valid else "failed"
+
+    elif operation == "aggregation":
+        valid = np.isfinite(result)
+        return "success" if valid else "failed"
+
+    elif operation == "groupby":
+        valid = (
+            result["PULocationID"].is_unique
+            and result["trip_distance_sum"].notna().all()
+        )
+        return "success" if valid else "failed"
+
+    return "failed"
+
+
+# ============================================================
+# EKSEKUSI BENCHMARK
+# ============================================================
 
 def run_benchmark():
-    rows = []
+    records = []
 
-    for dataset_name, filename, expected_rows in DATASETS:
-        path = os.path.join(DATA_DIR, filename)
+    print("=" * 70)
+    print("BENCHMARK DASK")
+    print("=" * 70)
 
-        print(f"\n[DASK] Dataset {dataset_name}: {filename}")
+    print(f"Jumlah dataset : {len(DATASET_FILES)}")
+    print(f"Jumlah repeat  : {REPEAT_COUNT}")
+    print(f"Scheduler      : {SCHEDULER}")
 
-        for repeat in range(1, REPEATS + 1):
-            # READ
-            def read_operation():
-                ddf = dd.read_parquet(path)
+    operations = {
+        "read": read_dataset,
+        "filter": filter_dataset,
+        "aggregation": aggregate_dataset,
+        "groupby": groupby_dataset,
+    }
 
-                # Materialisasi seluruh dataset agar data benar-benar dibaca
-                materialized = ddf.compute()
-                row_count = len(materialized)
+    for dataset_name, file_path in DATASET_FILES.items():
+        print(f"\nDataset: {dataset_name}")
+        print(f"File   : {file_path}")
 
-                del materialized
-
-                return ddf, row_count
-
-            (ddf, row_count), runtime, memory_mb, cpu_percent = measure(
-                read_operation
+        if not Path(file_path).exists():
+            raise FileNotFoundError(
+                f"Dataset tidak ditemukan: {file_path}"
             )
 
-            read_valid = row_count == expected_rows
+        # Menghitung jumlah baris dataset.
+        dataset = dd.read_parquet(file_path)
+        dataset_size = len(dataset)
 
-            rows.append({
-                "tool": "dask",
-                "operation": "read",
-                "dataset_size": dataset_name,
-                "repeat": repeat,
-                "runtime_seconds": runtime,
-                "memory_mb": memory_mb,
-                "cpu_percent": cpu_percent,
-                "output_rows": row_count,
-                "validated": read_valid,
-                "detail": (
-                    "row_count_valid"
-                    if read_valid
-                    else f"expected={expected_rows}, actual={row_count}"
-                ),
-            })
+        print(f"Jumlah baris: {dataset_size:,}")
 
-            # FILTER
-            def filter_operation():
-                filtered = ddf[ddf[VALUE_COL] > 0]
-                output_count = int(
-                    filtered.map_partitions(len).sum().compute()
-                )
-                return filtered, output_count
+        for operation_name, operation_func in operations.items():
+            print(f"\nOperasi: {operation_name}")
 
-            (filtered, filtered_count), runtime, memory_mb, cpu_percent = measure(
-                filter_operation
-            )
+            for repeat in range(1, REPEAT_COUNT + 1):
 
-            min_filtered = filtered[VALUE_COL].min().compute()
-
-            filter_valid = (
-                filtered_count <= row_count
-                and (
-                    filtered_count == 0
-                    or (
-                        pd.notna(min_filtered)
-                        and float(min_filtered) > 0
+                result, wall_time, cpu_time, memory_mb = (
+                    measure_peak_rss(
+                        lambda: operation_func(file_path)
                     )
                 )
-            )
 
-            rows.append({
-                "tool": "dask",
-                "operation": "filter",
-                "dataset_size": dataset_name,
-                "repeat": repeat,
-                "runtime_seconds": runtime,
-                "memory_mb": memory_mb,
-                "cpu_percent": cpu_percent,
-                "output_rows": filtered_count,
-                "validated": filter_valid,
-                "detail": (
-                    "predicate_valid"
-                    if filter_valid
-                    else f"filtered_min={min_filtered}"
-                ),
-            })
+                # --------------------------------------------
+                # METADATA HASIL
+                # --------------------------------------------
 
-            # AGGREGATION
-            def aggregation_operation():
-                return ddf[VALUE_COL].sum().compute()
+                if operation_name == "read":
+                    result_rows = len(result)
+                    result_sum = None
+                    result_groups = None
 
-            total, runtime, memory_mb, cpu_percent = measure(
-                aggregation_operation
-            )
+                elif operation_name == "filter":
+                    result_rows = len(result)
+                    result_sum = None
+                    result_groups = None
 
-            aggregation_valid = pd.notna(total) and math.isfinite(float(total))
+                elif operation_name == "aggregation":
+                    result_rows = 1
+                    result_sum = float(result)
+                    result_groups = None
 
-            rows.append({
-                "tool": "dask",
-                "operation": "aggregation",
-                "dataset_size": dataset_name,
-                "repeat": repeat,
-                "runtime_seconds": runtime,
-                "memory_mb": memory_mb,
-                "cpu_percent": cpu_percent,
-                "output_rows": 1,
-                "validated": bool(aggregation_valid),
-                "detail": (
-                    f"sum={float(total)}"
-                    if aggregation_valid
-                    else f"invalid_sum={total}"
-                ),
-            })
+                elif operation_name == "groupby":
+                    result_rows = len(result)
+                    result_sum = float(
+                        result["trip_distance_sum"].sum()
+                    )
+                    result_groups = len(result)
 
-            # GROUP BY
-            def groupby_operation():
-                return ddf.groupby(GROUP_COL)[VALUE_COL].sum().compute()
+                # --------------------------------------------
+                # VALIDASI HASIL
+                # --------------------------------------------
 
-            grouped, runtime, memory_mb, cpu_percent = measure(
-                groupby_operation
-            )
+                validation_status = validate_operation(
+                    operation=operation_name,
+                    result=result,
+                    dataset_size=dataset_size,
+                )
 
-            group_sum = grouped.sum()
-            group_valid = (
-                pd.notna(group_sum)
-                and validate_close(group_sum, total)
-            )
+                # --------------------------------------------
+                # MEMBUAT RECORD BENCHMARK
+                # --------------------------------------------
 
-            rows.append({
-                "tool": "dask",
-                "operation": "group_by",
-                "dataset_size": dataset_name,
-                "repeat": repeat,
-                "runtime_seconds": runtime,
-                "memory_mb": memory_mb,
-                "cpu_percent": cpu_percent,
-                "output_rows": len(grouped),
-                "validated": bool(group_valid),
-                "detail": (
-                    "group_sum_matches_total"
-                    if group_valid
-                    else f"group_sum={group_sum}, total={total}"
-                ),
-            })
+                record = create_result_record(
+                    tool=TOOL_NAME,
+                    dataset=dataset_name,
+                    dataset_size=dataset_size,
+                    operation=operation_name,
+                    repeat=repeat,
+                    wall_time=wall_time,
+                    cpu_time=cpu_time,
+                    memory_mb=memory_mb,
+                    result_rows=result_rows,
+                    result_sum=result_sum,
+                    result_groups=result_groups,
+                    validation_status=validation_status,
+                )
 
-            print(
-                f"  Repeat {repeat}/{REPEATS}: "
-                f"rows={row_count}, "
-                f"filter={filtered_count}, "
-                f"group_valid={group_valid}"
-            )
+                records.append(record)
 
-            del ddf, filtered, grouped
-            gc.collect()
+                print(
+                    f"  Repeat {repeat}/{REPEAT_COUNT} | "
+                    f"Wall: {wall_time:.4f}s | "
+                    f"CPU: {cpu_time:.4f}s | "
+                    f"RSS delta: {memory_mb:.2f} MB | "
+                    f"Status: {validation_status}"
+                )
 
-    output_path = os.path.join(OUTPUT_DIR, "benchmark_results.csv")
-    pd.DataFrame(rows).to_csv(output_path, index=False)
+    # ========================================================
+    # SIMPAN HASIL
+    # ========================================================
 
-    print(f"\ndask: {len(rows)} hasil ditulis ke {output_path}")
+    write_results_csv(records, RESULTS_PATH)
 
+    print("\n" + "=" * 70)
+    print("BENCHMARK DASK SELESAI")
+    print("=" * 70)
+    print(f"Hasil benchmark disimpan: {RESULTS_PATH}")
+    print(f"Jumlah record: {len(records)}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
     run_benchmark()
-

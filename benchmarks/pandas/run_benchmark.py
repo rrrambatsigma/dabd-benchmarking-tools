@@ -1,232 +1,352 @@
-﻿import csv
+﻿
+from __future__ import annotations
+
+import argparse
 import math
 import os
-import time
+import sys
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
-import psutil
+import pyarrow.parquet as pq
 
-TOOL = "pandas"
-DATA_DIR = Path(os.getenv("DATA_DIR", "/workspace/data/processed"))
-RESULTS_PATH = Path(
-    os.getenv("RESULTS_PATH", "/workspace/results/benchmark_results.csv")
+
+# ============================================================
+# KONFIGURASI PATH DAN IMPORT
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.benchmark_utils import (
+    DATASET_FILES,
+    REPEAT_COUNT,
+    create_result_record,
+    measure_peak_rss,
+    validate_dataset_files,
+    write_results_csv,
 )
-REPEATS = int(os.getenv("REPEATS", "5"))
-
-DATASETS = (
-    ("100k", "taxi_100k.parquet", 100_000),
-    ("1m", "taxi_1m.parquet", 1_000_000),
-    ("full", "taxi_full.parquet", 3_530_109),
-)
-
-VALUE_COL = "trip_distance"
-GROUP_COL = "PULocationID"
-
-FIELDS = [
-    "tool",
-    "operation",
-    "dataset_size",
-    "repeat",
-    "runtime_seconds",
-    "memory_mb",
-    "cpu_percent",
-    "output_rows",
-    "validated",
-    "detail",
-]
 
 
-def measure(func):
-    """Measure wall time, process CPU time, and RSS change."""
-    process = psutil.Process()
-    rss_before = process.memory_info().rss
-    cpu_before = time.process_time()
-    wall_before = time.perf_counter()
+TOOL_NAME = os.getenv("TOOL_NAME", "pandas")
 
-    result = func()
-
-    wall_seconds = time.perf_counter() - wall_before
-    cpu_seconds = time.process_time() - cpu_before
-    rss_after = process.memory_info().rss
-
-    cpu_percent = (
-        cpu_seconds / wall_seconds * 100
-        if wall_seconds > 0
-        else 0.0
+OUTPUT_FILE = Path(
+    os.getenv(
+        "RESULTS_PATH",
+        str(
+            PROJECT_ROOT
+            / "results"
+            / "raw"
+            / "pandas"
+            / "benchmark_results.csv"
+        ),
     )
-    memory_mb = (rss_after - rss_before) / (1024 * 1024)
-
-    return result, wall_seconds, memory_mb, cpu_percent
+)
 
 
-def add_result(
-    rows,
-    operation,
-    size_name,
-    repeat,
-    measurement,
-    output_rows,
-    validated,
-    detail,
-):
-    _, wall_seconds, memory_mb, cpu_percent = measurement
+# ============================================================
+# PEMBACAAN DATASET
+# ============================================================
 
-    rows.append(
-        {
-            "tool": TOOL,
-            "operation": operation,
-            "dataset_size": size_name,
-            "repeat": repeat,
-            "runtime_seconds": wall_seconds,
-            "memory_mb": memory_mb,
-            "cpu_percent": cpu_percent,
-            "output_rows": output_rows,
-            "validated": bool(validated),
-            "detail": detail,
+def read_dataset(dataset_path: Path) -> pd.DataFrame:
+    """Membaca seluruh dataset Parquet ke DataFrame Pandas."""
+
+    return pd.read_parquet(
+        dataset_path,
+        engine="pyarrow",
+    )
+
+
+# ============================================================
+# OPERASI BENCHMARK
+# ============================================================
+
+def execute_operation(
+    dataset_path: Path,
+    operation: str,
+) -> tuple[Any, dict[str, Any]]:
+    """
+    Menjalankan satu operasi benchmark.
+
+    Untuk filter, aggregation, dan groupby, waktu pembacaan
+    dataset termasuk dalam pengukuran end-to-end.
+    """
+
+    if operation == "read":
+        result = read_dataset(dataset_path)
+
+        metrics = {
+            "result_rows": len(result),
+            "result_sum": None,
+            "result_groups": None,
         }
+
+        return result, metrics
+
+    df = read_dataset(dataset_path)
+
+    if operation == "filter":
+        result = df.loc[
+            df["trip_distance"] > 0
+        ].copy()
+
+        metrics = {
+            "result_rows": len(result),
+            "result_sum": None,
+            "result_groups": None,
+        }
+
+        return result, metrics
+
+    if operation == "aggregation":
+        result = df["trip_distance"].sum(
+            min_count=1
+        )
+
+        metrics = {
+            "result_rows": None,
+            "result_sum": (
+                float(result)
+                if pd.notna(result)
+                else None
+            ),
+            "result_groups": None,
+        }
+
+        return result, metrics
+
+    if operation == "groupby":
+        result = (
+            df.groupby(
+                "PULocationID",
+                dropna=False,
+                sort=True,
+            )["trip_distance"]
+            .sum(min_count=1)
+            .reset_index(name="trip_distance_sum")
+        )
+
+        valid_sums = result[
+            "trip_distance_sum"
+        ].dropna()
+
+        total_sum = (
+            float(valid_sums.sum(min_count=1))
+            if not valid_sums.empty
+            else None
+        )
+
+        metrics = {
+            "result_rows": None,
+            "result_sum": total_sum,
+            "result_groups": len(result),
+        }
+
+        return result, metrics
+
+    raise ValueError(
+        f"Operasi tidak dikenal: {operation}"
     )
 
 
-def main():
-    if REPEATS < 1:
-        raise ValueError("REPEATS harus minimal 1.")
+# ============================================================
+# VALIDASI HASIL OPERASI
+# ============================================================
 
-    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    rows = []
+def validate_operation_result(
+    operation: str,
+    result: Any,
+    dataset_path: Path,
+    metrics: dict[str, Any],
+) -> None:
+    """Memastikan operasi menghasilkan output yang valid."""
 
-    for size_name, filename, expected_rows in DATASETS:
-        data_path = DATA_DIR / filename
+    if operation == "read":
+        expected_rows = pq.ParquetFile(
+            dataset_path
+        ).metadata.num_rows
 
-        if not data_path.is_file():
-            raise FileNotFoundError(
-                f"Dataset tidak ditemukan: {data_path}"
+        if len(result) != expected_rows:
+            raise ValueError(
+                f"Read tidak valid: expected={expected_rows}, "
+                f"actual={len(result)}"
             )
 
-        print(f"\n[PANDAS] Dataset {size_name}: {filename}")
-
-        for repeat in range(1, REPEATS + 1):
-            frame, wall, memory, cpu = measure(
-                lambda: pd.read_parquet(data_path)
+        if "trip_distance" not in result.columns:
+            raise ValueError(
+                "Kolom trip_distance tidak ditemukan."
             )
 
-            actual_rows = len(frame)
-            read_valid = actual_rows == expected_rows
-
-            add_result(
-                rows,
-                "read",
-                size_name,
-                repeat,
-                (frame, wall, memory, cpu),
-                actual_rows,
-                read_valid,
-                f"read_parquet({filename})",
+    elif operation == "filter":
+        if not isinstance(result, pd.DataFrame):
+            raise TypeError(
+                "Hasil filter bukan DataFrame."
             )
 
-            if not read_valid:
+        invalid_rows = result.loc[
+            ~(result["trip_distance"] > 0)
+        ]
+
+        if not invalid_rows.empty:
+            raise ValueError(
+                "Hasil filter masih mengandung baris "
+                "dengan trip_distance <= 0 atau null."
+            )
+
+        if len(result) != metrics["result_rows"]:
+            raise ValueError(
+                "Jumlah baris filter tidak konsisten."
+            )
+
+    elif operation == "aggregation":
+        if metrics["result_sum"] is not None:
+            if not math.isfinite(
+                metrics["result_sum"]
+            ):
                 raise ValueError(
-                    f"Jumlah baris tidak sesuai: {filename}; "
-                    f"expected={expected_rows}, actual={actual_rows}"
+                    "Hasil aggregation bukan angka finite."
                 )
 
-            required = {VALUE_COL, GROUP_COL}
-            missing = required - set(frame.columns)
-            if missing:
-                raise ValueError(
-                    f"Kolom wajib tidak ditemukan: {sorted(missing)}"
-                )
-
-            # FILTER: trip_distance > 0
-            mask = frame[VALUE_COL] > 0
-
-            filtered, wall, memory, cpu = measure(
-                lambda: frame.loc[mask]
+    elif operation == "groupby":
+        if not isinstance(result, pd.DataFrame):
+            raise TypeError(
+                "Hasil groupby bukan DataFrame."
             )
 
-            filter_valid = (
-                len(filtered) == int(mask.sum())
-                and bool((filtered[VALUE_COL] > 0).all())
+        if result["PULocationID"].duplicated().any():
+            raise ValueError(
+                "Hasil groupby memiliki kunci grup duplikat."
             )
 
-            add_result(
-                rows,
-                "filter",
-                size_name,
-                repeat,
-                (filtered, wall, memory, cpu),
-                len(filtered),
-                filter_valid,
-                f"{VALUE_COL} > 0",
+        if len(result) != metrics["result_groups"]:
+            raise ValueError(
+                "Jumlah grup tidak konsisten."
             )
 
-            # AGGREGATION: sum(trip_distance)
-            total, wall, memory, cpu = measure(
-                lambda: frame[VALUE_COL].sum()
-            )
 
-            aggregation_valid = math.isfinite(float(total))
+# ============================================================
+# RUN BENCHMARK
+# ============================================================
 
-            add_result(
-                rows,
-                "aggregation",
-                size_name,
-                repeat,
-                (total, wall, memory, cpu),
+def run_benchmark() -> list[dict[str, Any]]:
+    """Menjalankan eksperimen Pandas."""
+
+    validate_dataset_files()
+
+    if OUTPUT_FILE.exists():
+        raise FileExistsError(
+            f"File hasil sudah ada: {OUTPUT_FILE}\n"
+            "Arsipkan hasil lama terlebih dahulu."
+        )
+
+    records: list[dict[str, Any]] = []
+
+    operations = [
+        "read",
+        "filter",
+        "aggregation",
+        "groupby",
+    ]
+
+    for dataset_name, dataset_path in DATASET_FILES.items():
+        dataset_size = pq.ParquetFile(
+            dataset_path
+        ).metadata.num_rows
+
+        print(
+            f"\n{'=' * 65}\n"
+            f"DATASET: {dataset_name} "
+            f"({dataset_size:,} baris)\n"
+            f"{'=' * 65}"
+        )
+
+        for operation in operations:
+            for repeat in range(
                 1,
-                aggregation_valid,
-                f"sum({VALUE_COL})",
-            )
-
-            # GROUP BY: PULocationID -> sum(trip_distance)
-            grouped, wall, memory, cpu = measure(
-                lambda: frame.groupby(
-                    GROUP_COL,
-                    dropna=False,
-                )[VALUE_COL].sum()
-            )
-
-            grouped_total = grouped.sum()
-            group_valid = (
-                len(grouped) > 0
-                and math.isclose(
-                    float(grouped_total),
-                    float(total),
-                    rel_tol=1e-9,
-                    abs_tol=1e-6,
+                REPEAT_COUNT + 1,
+            ):
+                print(
+                    f"[{TOOL_NAME}] "
+                    f"{dataset_name} | {operation} | "
+                    f"repeat {repeat}/{REPEAT_COUNT}"
                 )
-            )
 
-            add_result(
-                rows,
-                "group_by",
-                size_name,
-                repeat,
-                (grouped, wall, memory, cpu),
-                len(grouped),
-                group_valid,
-                f"group by {GROUP_COL}, sum({VALUE_COL})",
-            )
+                result, wall_time, cpu_time, memory_mb = (
+                    measure_peak_rss(
+                        lambda: execute_operation(
+                            dataset_path,
+                            operation,
+                        )
+                    )
+                )
 
-            print(
-                f"  Repeat {repeat}/{REPEATS}: "
-                f"rows={actual_rows}, "
-                f"group_valid={group_valid}"
-            )
+                output, metrics = result
 
-    with RESULTS_PATH.open(
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as file:
-        writer = csv.DictWriter(file, fieldnames=FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
+                validate_operation_result(
+                    operation=operation,
+                    result=output,
+                    dataset_path=dataset_path,
+                    metrics=metrics,
+                )
 
-    print(
-        f"\n{TOOL}: {len(rows)} hasil ditulis ke {RESULTS_PATH}"
+                records.append(
+                    create_result_record(
+                        tool=TOOL_NAME,
+                        dataset=dataset_name,
+                        dataset_size=dataset_size,
+                        operation=operation,
+                        repeat=repeat,
+                        wall_time=wall_time,
+                        cpu_time=cpu_time,
+                        memory_mb=memory_mb,
+                        result_rows=metrics["result_rows"],
+                        result_sum=metrics["result_sum"],
+                        result_groups=metrics["result_groups"],
+                    )
+                )
+
+                print(
+                    f"  wall={wall_time:.4f}s | "
+                    f"CPU={cpu_time:.4f}s | "
+                    f"sampled peak RSS delta={memory_mb:.2f} MB"
+                )
+
+    write_results_csv(
+        records,
+        OUTPUT_FILE,
     )
+
+    print("\n=== BENCHMARK PANDAS SELESAI ===")
+    print(f"Total eksperimen: {len(records)}")
+
+    return records
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Benchmark Pandas pada dataset "
+            "NYC Yellow Taxi."
+        )
+    )
+    parser.parse_args()
+
+    try:
+        run_benchmark()
+        return 0
+
+    except Exception as error:
+        print(
+            f"\n[ERROR] {type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
