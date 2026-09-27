@@ -1,0 +1,70 @@
+services:
+  pandas-benchmark:
+    build:
+      context: .
+      dockerfile: benchmarks/pandas/Dockerfile
+    image: dabd-benchmark-pandas:latest
+    profiles: ["benchmark"]
+    volumes:
+      - ./data:/workspace/data:ro
+      - ./results/raw/pandas:/workspace/results
+    environment:
+      TOOL_NAME: pandas
+      DATA_DIR: /workspace/data/processed
+      REPEATS: "5"
+      RESULTS_PATH: /workspace/results/benchmark_results.csv
+    cpus: 2.0
+    mem_limit: 4g
+
+  polars-benchmark:
+    build:
+      context: .
+      dockerfile: benchmarks/polars/Dockerfile
+    image: dabd-benchmark-polars:latest
+    profiles: ["benchmark"]
+    volumes:
+      - ./data:/workspace/data:ro
+      - ./results/raw/polars:/workspace/results
+    environment:
+      TOOL_NAME: polars
+      DATA_DIR: /workspace/data/processed
+      REPEATS: "5"
+      RESULTS_PATH: /workspace/results/benchmark_results.csv
+    cpus: 2.0
+    mem_limit: 4g
+
+  dask-benchmark:
+    build:
+      context: .
+      dockerfile: benchmarks/dask/Dockerfile
+    image: dabd-benchmark-dask:latest
+    profiles: ["benchmark"]
+    volumes:
+      - ./data:/workspace/data:ro
+      - ./results/raw/dask:/workspace/results
+    environment:
+      TOOL_NAME: dask
+      DATA_DIR: /workspace/data/processed
+      REPEATS: "5"
+      RESULTS_PATH: /workspace/results/benchmark_results.csv
+    cpus: 2.0
+    mem_limit: 4g
+
+  jupyter-analysis:
+    build:
+      context: .
+      dockerfile: analysis/Dockerfile
+    image: dabd-benchmark-analysis:latest
+    ports:
+      - "127.0.0.1:8888:8888"
+    volumes:
+      - ./notebooks:/workspace/notebooks
+      - ./results:/workspace/results:ro
+    working_dir: /workspace
+    command:
+      - jupyter
+      - lab
+      - --ip=0.0.0.0
+      - --port=8888
+      - --no-browser
+      - --allow-root
